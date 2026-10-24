@@ -133,6 +133,7 @@ public:
     bool checkpoint_restore(const strata::core::ConversationCheckpoint& c, std::string& err);
     void reset();   // a new sequence (session_zero): the running state zeroed
     void set_max_t(int t) { max_t_ = std::min(t, MAXT); }
+    void bind_session(strata::core::SessionState& ss);
     // ---- the MTP draft layer (mtp.hpp's math on mac-kern's kernels; the MTP GGUF from tools/mtp_pack.py)
     bool mtp_load(const std::string& gguf, int max_t, std::string& err);
     bool mtp_prefill(const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err);
@@ -639,6 +640,7 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     }
     ple_hist_.assign((size_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM, 0.0f);
     last_norm_.assign((size_t) MAXT * strata::kernels::NG_HC_DIM, 0.0f);
+    bind_session(ss);
     std::fprintf(stderr, "strata metal: decode window on %s: %s %s (%.1f GB), %d cells, PLE %s, ready in %.0f ms\n",
                  cx_->device_name().c_str(), shard1.c_str(), stream_ ? "streamed from the SSD (experts)" : "wrapped",
                  f_.file_bytes / 1e9, MAXC, ple_on_ ? "on" : "OFF", now_ms() - t0);
@@ -1521,7 +1523,7 @@ bool Window::checkpoint_save(strata::core::ConversationCheckpoint& c, std::strin
         std::memcpy(c.tails.data() + j * ts, tail_[j].ptr, ts);
         std::memcpy(c.dead.data() + j * dsz, dead_[j].ptr, dsz);
     }
-    c.block_pos.clear();
+    c.block_pos.assign(tail_.size() * sizeof(int32_t), 0);
     return true;
 }
 
@@ -1563,7 +1565,43 @@ bool Window::checkpoint_restore(const strata::core::ConversationCheckpoint& c, s
         std::memcpy(tail_[j].ptr, c.tails.data() + j * ts, ts);
         std::memcpy(dead_[j].ptr, c.dead.data() + j * dsz, dsz);
     }
+    if (!c.ids.empty()) {
+        const size_t row = c.ids.size() / 4;
+        const size_t max_rows = (size_t) (max_cells_ / 4 + 2);
+        if (row < max_rows) {
+            for (size_t j = 0; j < pooled_.size(); ++j) {
+                std::memcpy((float*) pooled_[j].ptr + row * 128, dead_[j].ptr, dsz);
+            }
+        }
+    }
     return true;
+}
+
+void Window::bind_session(strata::core::SessionState& ss) {
+    ss_ = &ss;
+    const int MB = max_cells_ / 4 + 2;
+    if (ss.qsa_states != nullptr) {
+        for (size_t j = 0; j < kq_.size() && j < (size_t) ss.qsa_alloc; ++j) {
+            auto& st = ss.qsa_states[ss.qsa_ord0 + j];
+            st.k_q = (int8_t*) kq_[j].ptr;
+            st.v_q = (int8_t*) vq_[j].ptr;
+            st.k_scale = (uint16_t*) ksc_[j].ptr;
+            st.v_scale = (uint16_t*) vsc_[j].ptr;
+            st.idx_pooled = (float*) pooled_[j].ptr;
+            st.idx_pooled_rows = MB;
+            st.idx_tail = (float*) tail_[j].ptr;
+            st.idx_dead = (float*) dead_[j].ptr;
+            st.idx_block_pos = (int32_t*) dead_[j].ptr;
+            st.kv_int8 = true;
+            st.kv_q4 = false;
+            st.kv_hybrid = false;
+            st.kv_rot = false;
+            st.kv_mode = 0;
+            st.n_slots = max_cells_ / 4;
+            st.n_pages = max_cells_ / 4;
+            st.max_cells = max_cells_;
+        }
+    }
 }
 
 bool Window::commit(int n_keep, std::string& err) {
@@ -2613,6 +2651,8 @@ bool window_init(void* w, const strata::core::ModelGeometry& g, strata::core::Se
         if (!x->init(g, ss, g_shard1, MAXT, max_cells, err)) return false;
         window_register(w);
         if (!mtp_load_pending(x, err)) return false;
+    } else {
+        x->bind_session(ss);
     }
     x->set_max_t(max_t);
     *n_vocab = x->vocab();

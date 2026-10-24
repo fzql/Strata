@@ -115,8 +115,13 @@ bool conversation_state_sizes(const ModelGeometry& g, ConversationStateSizes& z,
         !add(recurrence, convolution) ||
         !product(z.gdn, {(uint64_t) g.n_gdn_layers(), recurrence, sizeof(float)}) ||
         !product(z.ple, {strata::kernels::NG_HIST, strata::kernels::NG_HC_DIM, sizeof(float)}) ||
+#if defined(STRATA_GPU_METAL)
+        !product(z.tail, {(uint64_t) strata::kernels::qsa_real_shapes().idx_block,
+                          (uint64_t) g.idx_key_dim, sizeof(float)}) ||
+#else
         !product(z.tail, {(uint64_t) (strata::kernels::qsa_real_shapes().idx_block - 1),
                           (uint64_t) g.idx_key_dim, sizeof(float)}) ||
+#endif
         !product(z.dead, {(uint64_t) g.idx_key_dim, sizeof(float)}))
         return fail(error, "running-state byte count overflow");
     z.block_pos = sizeof(int32_t);
@@ -146,8 +151,18 @@ bool conversation_checkpoint_validate(const ConversationCheckpoint& c, const Ses
     if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
     const size_t layers = owned_qsa(ss);
     if (c.gdn.size() != z.gdn || c.ple.size() != (ss.ple_hist ? z.ple : 0) ||
-        c.tails.size() != layers * z.tail || c.dead.size() != layers * z.dead ||
-        c.block_pos.size() != layers * z.block_pos || !image_keys(c.imgs, c.ids.size()))
+#if defined(STRATA_GPU_METAL)
+        (c.tails.size() != layers * z.tail && c.tails.size() != layers * (size_t) (g.idx_block - 1) * g.idx_key_dim * sizeof(float)) ||
+#else
+        c.tails.size() != layers * z.tail ||
+#endif
+        c.dead.size() != layers * z.dead ||
+#if defined(STRATA_GPU_METAL)
+        (!c.block_pos.empty() && c.block_pos.size() != layers * z.block_pos) ||
+#else
+        c.block_pos.size() != layers * z.block_pos ||
+#endif
+        !image_keys(c.imgs, c.ids.size()))
         return fail(error, "invalid checkpoint running-state payload");
     return true;
 }
